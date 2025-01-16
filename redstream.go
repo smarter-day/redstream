@@ -24,6 +24,9 @@ type Config struct {
 	// It should be unique. Use UniqueConsumerName helper method to generate a unique name based on your own name.
 	ConsumerName string `validate:"required"`
 
+	// MaxConcurrency represents the maximum number of concurrent consumers.
+	MaxConcurrency int
+
 	// LockExpiryStr represents the duration for which the lock will be held.
 	LockExpiryStr string `validate:"duration"`
 	// LockExtendStr represents the duration for which the lock will be extended after it's held.
@@ -68,6 +71,8 @@ type RedisStream struct {
 	debugLogger LogFn
 	infoLogger  LogFn
 	errorLogger LogFn
+
+	concurrencyCh chan struct{}
 }
 
 // New creates and initializes a new IRedStream instance.
@@ -107,6 +112,9 @@ func New(redisOptions *redis.UniversalOptions, cfg Config) IRedStream {
 	}
 	if cfg.ReclaimMaxExponentialFactor <= 0 {
 		cfg.ReclaimMaxExponentialFactor = 3
+	}
+	if cfg.MaxConcurrency <= 0 {
+		cfg.MaxConcurrency = 10
 	}
 	if lockExtend >= lockExpiry {
 		log.Fatalf("Lock extend interval (%v) must be < lock expiry (%v)", lockExtend, lockExpiry)
@@ -218,8 +226,9 @@ func (r *RedisStream) Publish(ctx context.Context, data any) (string, error) {
 	}
 
 	if r.Cfg.DropConcurrentDuplicates {
+		// Increase lock expiry to 500ms (vs. 100ms) to reduce chance of missing duplicates
 		publishLockStr := publishLockKey(r.Cfg.StreamName, raw)
-		pubLock := r.Rs.NewMutex(publishLockStr, redsync.WithExpiry(100*time.Millisecond), redsync.WithTries(1))
+		pubLock := r.Rs.NewMutex(publishLockStr, redsync.WithExpiry(500*time.Millisecond), redsync.WithTries(1))
 		if e := pubLock.LockContext(ctx); e != nil {
 			r.debug(ctx, "concurrency duplicate lock taken:", publishLockStr)
 			return "", nil
@@ -256,10 +265,18 @@ func (r *RedisStream) StartConsumer(ctx context.Context) error {
 	if r.handler == nil {
 		return fmt.Errorf("handler function not set")
 	}
+
+	// Optional concurrency limit
+	if r.Cfg.MaxConcurrency > 0 {
+		r.concurrencyCh = make(chan struct{}, r.Cfg.MaxConcurrency)
+	}
+
 	go r.listenNewMessages(ctx)
+
 	if r.Cfg.EnableReclaim {
 		go r.autoClaimLoop(ctx)
 	}
+
 	return nil
 }
 
@@ -353,6 +370,12 @@ func (r *RedisStream) autoClaimLoop(ctx context.Context) {
 // The function does not return any value. It logs various stages of message
 // processing using the RedisStream's logging methods.
 func (r *RedisStream) processMessage(ctx context.Context, msg redis.XMessage) {
+	// Optional concurrency limit
+	if r.concurrencyCh != nil {
+		r.concurrencyCh <- struct{}{}
+		defer func() { <-r.concurrencyCh }()
+	}
+
 	fields := convertFields(msg.Values)
 	jsonString, ok := fields["json"]
 	if !ok {
@@ -367,8 +390,9 @@ func (r *RedisStream) processMessage(ctx context.Context, msg redis.XMessage) {
 	}
 	r.debug(ctx, "acquired for msg:", msg)
 
-	extendCtx, cancel := context.WithCancel(ctx)
-	go r.extendLockLoop(extendCtx, msg.ID, mutex)
+	// We create a context we can cancel if the lock extension fails
+	extendCtx, extendCancel := context.WithCancel(ctx)
+	go r.extendLockLoop(extendCtx, msg.ID, mutex, extendCancel)
 
 	var handlerErr error
 	if r.handler != nil {
@@ -376,43 +400,33 @@ func (r *RedisStream) processMessage(ctx context.Context, msg redis.XMessage) {
 	}
 
 	attemptsKeyStr := reclaimAttemptsKey(r.Cfg)
-
 	pipe := r.Client.Pipeline()
 
 	if handlerErr == nil {
-		// ----------------
-		// SUCCESS => ACK
-		// ----------------
+		// Success => ACK & delete
 		r.ackAndDelete(ctx, pipe, msg.ID)
-		// Clear leftover attempts, backoff info, etc.
 		_, _ = pipe.HDel(ctx, attemptsKeyStr,
-			msg.ID, // old "timestamp:count" if you used that
+			msg.ID,
 			msg.ID+":count",
 			msg.ID+":ts",
 			msg.ID+":nextBackoffSec",
 		).Result()
 
-		_, err := pipe.Exec(ctx)
-		if err != nil {
+		if _, err := pipe.Exec(ctx); err != nil {
 			r.err(ctx, "ackAndDelete fail:", msg, err)
 		} else {
 			r.debug(ctx, "success & deleted msg:", msg)
 		}
 
 	} else {
-		// ----------------------------------
-		// FAILURE => increment attempt count
-		// ----------------------------------
+		// Failure => increment attempt count
 		nowSec := time.Now().Unix()
 		countKey := msg.ID + ":count"
 		tsKey := msg.ID + ":ts"
 		backoffKey := msg.ID + ":nextBackoffSec"
 
-		// 1) newCount
 		newCount, _ := pipe.HIncrBy(ctx, attemptsKeyStr, countKey, 1).Result()
-
 		if newCount > int64(r.Cfg.MaxReclaimAttempts) {
-			// If dead letter queue (DLQ) handler is set, call it first
 			var dlqHandlerErr error
 			isDLQHandlerSet := r.Cfg.DLQHandler != nil
 
@@ -430,10 +444,8 @@ func (r *RedisStream) processMessage(ctx context.Context, msg redis.XMessage) {
 			shouldRemove := !isDLQHandlerSet || (isDLQHandlerSuccessful || shouldIgnoreDLQErrors)
 
 			if shouldRemove {
-				// skip & remove fully
 				r.err(ctx, "msg exceeded attempts:", msg, handlerErr)
 				r.ackAndDelete(ctx, pipe, msg.ID)
-				// also remove all fields
 				_, _ = pipe.HDel(ctx, attemptsKeyStr,
 					msg.ID,
 					countKey,
@@ -443,31 +455,26 @@ func (r *RedisStream) processMessage(ctx context.Context, msg redis.XMessage) {
 			}
 		} else {
 			r.err(ctx, "handler fail for msg:", msg, handlerErr)
-			// we do NOT ack => message remains in PEL, can be reclaimed again
-
-			// 2) update the :ts field for debugging
+			// We do NOT ack => remains in PEL
 			_, _ = pipe.HSet(ctx, attemptsKeyStr, tsKey, nowSec).Result()
 
-			// 3) exponential backoff
-			//    e.g. factor = min(2^(newCount-1), 16) so it won't grow unbounded.
-			factor := 1 << newCount // 2^(count-1)
+			// Exponential backoff
+			factor := 1 << newCount
 			if factor > r.Cfg.ReclaimMaxExponentialFactor {
 				factor = r.Cfg.ReclaimMaxExponentialFactor
 			}
-
 			nextBackoffSec := nowSec + int64(r.ReclaimInterval.Seconds())*int64(factor)
-
-			// store in Redis
 			_, _ = pipe.HSet(ctx, attemptsKeyStr, backoffKey, nextBackoffSec).Result()
 		}
 
-		_, pipeErr := pipe.Exec(ctx)
-		if pipeErr != nil {
+		if _, pipeErr := pipe.Exec(ctx); pipeErr != nil {
 			r.err(ctx, "process fail:", msg, pipeErr)
 		}
 	}
 
-	cancel()
+	// Stop the lock-extension goroutine
+	extendCancel()
+
 	if _, uErr := mutex.Unlock(); uErr != nil {
 		r.err(ctx, "unlock fail for msg:", msg, uErr)
 	}
@@ -488,9 +495,10 @@ func (r *RedisStream) processMessage(ctx context.Context, msg redis.XMessage) {
 // The function does not return any value. It runs as a long-lived goroutine,
 // extending the lock at regular intervals until the context is cancelled or
 // an error occurs.
-func (r *RedisStream) extendLockLoop(ctx context.Context, msgID string, m *redsync.Mutex) {
+func (r *RedisStream) extendLockLoop(ctx context.Context, msgID string, m *redsync.Mutex, cancel context.CancelFunc) {
 	ticker := time.NewTicker(r.LockExtend)
 	defer ticker.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -499,6 +507,8 @@ func (r *RedisStream) extendLockLoop(ctx context.Context, msgID string, m *redsy
 			ok, err := m.ExtendContext(ctx)
 			if err != nil || !ok {
 				r.err(ctx, "lock extend fail for msg:", msgID, err)
+				// Cancel so the handler code can end
+				cancel()
 				return
 			}
 			r.debug(ctx, "extended for msg:", msgID)
@@ -533,7 +543,7 @@ func (r *RedisStream) reclaimPending(ctx context.Context) {
 		redsync.WithTries(1),
 	)
 	if err := reclaimLock.LockContext(ctx); err != nil {
-		// Another process holds the reclaim lock, so skip for now
+		// Another process holds the reclaim lock
 		return
 	}
 	defer func() {
@@ -542,7 +552,6 @@ func (r *RedisStream) reclaimPending(ctx context.Context) {
 		}
 	}()
 
-	// 1) Fetch the previously stored nextStart offset (or default to "0-0")
 	reclaimNextStartKeyStr := reclaimNextStartKey(r.Cfg)
 	storedStart, _ := r.Client.Get(ctx, reclaimNextStartKeyStr).Result()
 	if storedStart == "" {
@@ -552,66 +561,69 @@ func (r *RedisStream) reclaimPending(ctx context.Context) {
 	attemptsKeyStr := reclaimAttemptsKey(r.Cfg)
 	startID := storedStart
 
-	// 2) XAUTOCLAIM pending messages
-	claimed, newNextStart, err := r.Client.XAutoClaim(ctx, &redis.XAutoClaimArgs{
-		Stream:   r.Cfg.StreamName,
-		Group:    r.Cfg.GroupName,
-		Consumer: r.Cfg.ConsumerName,
-		MinIdle:  r.LockExpiry,
-		Start:    startID,
-		Count:    r.Cfg.ReclaimCount,
-	}).Result()
-	if err != nil {
-		r.err(ctx, "XAutoClaim error", err)
-		return
-	}
-	r.debug(ctx, "reclaimed", len(claimed), "messages, next start:", newNextStart)
+	// Keep calling XAutoClaim until no more big chunks left
+	for {
+		claimed, newNextStart, err := r.Client.XAutoClaim(ctx, &redis.XAutoClaimArgs{
+			Stream:   r.Cfg.StreamName,
+			Group:    r.Cfg.GroupName,
+			Consumer: r.Cfg.ConsumerName,
+			MinIdle:  r.LockExpiry,
+			Start:    startID,
+			Count:    r.Cfg.ReclaimCount,
+		}).Result()
 
-	pipe := r.Client.Pipeline()
+		if err != nil {
+			r.err(ctx, "XAutoClaim error", err)
+			return
+		}
+		r.debug(ctx, "reclaimed", len(claimed), "messages, next start:", newNextStart)
 
-	// 3) For each claimed message, increment attempts and reprocess or remove
-	for _, m := range claimed {
-		countKey := m.ID + ":count"
-		tsKey := m.ID + ":ts"
-		backoffKey := m.ID + ":nextBackoffSec"
+		pipe := r.Client.Pipeline()
 
-		// 1) check if we're in the backoff window
-		val, _ := pipe.HGet(ctx, attemptsKeyStr, backoffKey).Result()
-		if val != "" {
-			nextSec, _ := strconv.ParseInt(val, 10, 64)
-			nowSec := time.Now().Unix()
-			if nowSec < nextSec {
-				// skip this message, leaving it unacked => remains pending
-				r.debug(ctx, "skip, still in backoff for msg:", m.ID)
-				continue
+		for _, m := range claimed {
+			countKey := m.ID + ":count"
+			tsKey := m.ID + ":ts"
+			backoffKey := m.ID + ":nextBackoffSec"
+
+			val, _ := pipe.HGet(ctx, attemptsKeyStr, backoffKey).Result()
+			if val != "" {
+				nextSec, _ := strconv.ParseInt(val, 10, 64)
+				nowSec := time.Now().Unix()
+				if nowSec < nextSec {
+					r.debug(ctx, "skip, still in backoff for msg:", m.ID)
+					continue
+				}
+			}
+
+			newCount, _ := pipe.HIncrBy(ctx, attemptsKeyStr, countKey, 1).Result()
+			_, _ = pipe.HSet(ctx, attemptsKeyStr, tsKey, time.Now().Unix()).Result()
+
+			if newCount > int64(r.Cfg.MaxReclaimAttempts) {
+				r.err(ctx, "msg exceeded attempts:", m.ID)
+				r.ackAndDelete(ctx, pipe, m.ID)
+			} else {
+				// Reprocess in a goroutine (still might want concurrency-limits)
+				go r.processMessage(ctx, m)
 			}
 		}
 
-		// HINCRBY attempt count
-		newCount, _ := pipe.HIncrBy(ctx, attemptsKeyStr, countKey, 1).Result()
-		// Optionally store a timestamp for debugging
-		_, _ = pipe.HSet(ctx, attemptsKeyStr, tsKey, time.Now().Unix()).Result()
-
-		if newCount > int64(r.Cfg.MaxReclaimAttempts) {
-			r.err(ctx, "msg exceeded attempts:", m.ID)
-			r.ackAndDelete(ctx, pipe, m.ID)
-		} else {
-			// Reprocess in a goroutine
-			go r.processMessage(ctx, m)
+		// Update next reclaim start
+		if isGreaterID(newNextStart, startID) {
+			_, _ = pipe.Set(ctx, reclaimNextStartKeyStr, newNextStart, 0).Result()
 		}
+
+		if _, execErr := pipe.Exec(ctx); execErr != nil {
+			r.err(ctx, "pipeline exec failed:", execErr)
+		}
+
+		// Stop if fewer than Count or ID not advancing
+		if len(claimed) < int(r.Cfg.ReclaimCount) || !isGreaterID(newNextStart, startID) {
+			break
+		}
+		startID = newNextStart
 	}
 
-	// 4) If nextStart advanced, store it so next pass doesn't re-scan
-	if isGreaterID(newNextStart, startID) {
-		_, _ = pipe.Set(ctx, reclaimNextStartKeyStr, newNextStart, 0).Result()
-	}
-
-	// 5) Execute pipeline
-	if _, execErr := pipe.Exec(ctx); execErr != nil {
-		r.err(ctx, "pipeline exec failed:", execErr)
-	}
-
-	// 6) Clean up old reclaim records
+	// Finally, cleanup old reclaim records
 	r.cleanupOldReclaimRecords(ctx, attemptsKeyStr)
 }
 
@@ -626,31 +638,37 @@ func (r *RedisStream) reclaimPending(ctx context.Context) {
 // The function does not return any value. It logs errors using the RedisStream's error logger
 // if there's a failure in retrieving the hash entries.
 func (r *RedisStream) cleanupOldReclaimRecords(ctx context.Context, key string) {
-	pipe := r.Client.Pipeline()
-	defer func() {
-		_, err := pipe.Exec(ctx)
-		if err != nil {
-			r.err(ctx, "pipeline exec failed:", err)
-		}
-	}()
-	all, err := pipe.HGetAll(ctx, key).Result()
+	all, err := r.Client.HGetAll(ctx, key).Result()
 	if err != nil {
 		r.err(ctx, "cleanup - HGetAll failed:", err)
 		return
 	}
+
 	nowSec := time.Now().Unix()
-	for msgID, val := range all {
-		parts := strings.SplitN(val, ":", 2)
-		if len(parts) != 2 {
-			continue
+	pipe := r.Client.Pipeline()
+
+	for field, val := range all {
+		// Only handle fields that store a timestamp
+		if strings.HasSuffix(field, ":ts") {
+			ts, convErr := strconv.ParseInt(val, 10, 64)
+			if convErr != nil {
+				continue
+			}
+			if float64(nowSec-ts) > r.CleanOldReclaimDuration.Seconds() {
+				// baseID = msg.ID, e.g. removing "xyz-123:ts" => baseID="xyz-123"
+				baseID := strings.TrimSuffix(field, ":ts")
+				pipe.HDel(ctx, key,
+					field,           // The ts field
+					baseID,          // In case we stored something at baseID
+					baseID+":count", // Attempts count
+					baseID+":nextBackoffSec",
+				)
+			}
 		}
-		ts, err := strconv.ParseInt(parts[0], 10, 64)
-		if err != nil {
-			continue
-		}
-		if float64(nowSec-ts) > r.CleanOldReclaimDuration.Seconds() {
-			_, _ = pipe.HDel(ctx, key, msgID).Result()
-		}
+	}
+
+	if _, execErr := pipe.Exec(ctx); execErr != nil {
+		r.err(ctx, "pipeline exec failed:", execErr)
 	}
 }
 
