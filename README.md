@@ -1,5 +1,6 @@
 <img src="assets/stream.png" alt="Redis Stream" />
 
+
 [![Build & Test](https://github.com/smarter-day/redstream/actions/workflows/build-and-test.yml/badge.svg?branch=main)](https://github.com/smarter-day/redstream/actions/workflows/build-and-test.yml)
 
 A **Golang** library for robust **Redis Streams** consumption with:
