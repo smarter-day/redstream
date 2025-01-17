@@ -1,0 +1,53 @@
+version: '3.9'
+services:
+  redis:
+    image: redis:7
+    container_name: my_redis
+    ports:
+      - "6379:6379"
+  db:
+    image: postgres:15
+    container_name: my_db
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: secret
+      POSTGRES_DB: testdb
+    ports:
+      - "5432:5432"
+  publisher:
+    build: .
+    container_name: publisher
+    environment:
+      ROLE: publisher
+      ITERATIONS: 10000
+      DELAY: 1ms
+    depends_on:
+      - redis
+      - db
+  consumer1:
+    build: .
+    container_name: consumer1
+    environment:
+      ROLE: subscriber
+      CONSUMER_NAME: consumer1
+    depends_on:
+      - redis
+      - db
+  consumer2:
+    build: .
+    container_name: consumer2
+    environment:
+      ROLE: subscriber
+      CONSUMER_NAME: consumer2
+    depends_on:
+      - redis
+      - db
+  consumer3:
+    build: .
+    container_name: consumer3
+    environment:
+      ROLE: subscriber
+      CONSUMER_NAME: consumer3
+    depends_on:
+      - redis
+      - db
