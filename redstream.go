@@ -5,56 +5,46 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/go-redsync/redsync/v4"
-	redsyncredis "github.com/go-redsync/redsync/v4/redis/goredis/v9"
-	"github.com/redis/go-redis/v9"
+	"github.com/smarter-day/redstream/lua"
 	"log"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/go-redsync/redsync/v4"
+	redsyncredis "github.com/go-redsync/redsync/v4/redis/goredis/v9"
+	"github.com/redis/go-redis/v9"
 )
 
 // Config represents the configuration for the RedStream.
 type Config struct {
-	// StreamName represents the name of the Redis stream.
-	StreamName string `validate:"required"`
-	// GroupName represents the name of the consumer group.
-	GroupName string `validate:"required"`
-	// ConsumerName represents the name of the consumer.
-	// It should be unique. Use UniqueConsumerName helper method to generate a unique name based on your own name.
+	StreamName   string `validate:"required"`
+	GroupName    string `validate:"required"`
 	ConsumerName string `validate:"required"`
 
-	// MaxConcurrency represents the maximum number of concurrent consumers.
-	MaxConcurrency int
+	MaxConcurrency      int
+	UseDistributedLock  bool // if false => skip the redsnyc-based lock
+	NoProgressThreshold int  // after how many consecutive zero-reclaims do we call readPendingMessagesOnce
 
-	// LockExpiryStr represents the duration for which the lock will be held.
-	LockExpiryStr string `validate:"duration"`
-	// LockExtendStr represents the duration for which the lock will be extended after it's held.
-	LockExtendStr string `validate:"duration"`
-	// BlockDurationStr represents the duration for which the consumer will block if no new messages are available.
+	LockExpiryStr    string `validate:"duration"`
+	LockExtendStr    string `validate:"duration"`
 	BlockDurationStr string `validate:"duration"`
 
-	// EnableReclaim enables reclaiming messages.
-	EnableReclaim bool
-	// ReclaimStr represents the duration for which the consumer will reclaim messages if it's blocked.
-	ReclaimStr string `validate:"duration"`
-	// CleanOldReclaimDuration represents the duration for which old reclaim messages will be cleaned.
-	CleanOldReclaimDuration string `validate:"duration"`
-	// MaxReclaimAttempts represents the maximum number of attempts to reclaim messages.
-	MaxReclaimAttempts int
-	// ReclaimCount represents the number of times messages to reclaim.
-	ReclaimCount int64
-	// ReclaimMaxExponentialFactor represents the maximum exponential factor for reclaiming messages delay.
+	EnableReclaim               bool
+	ReclaimStr                  string `validate:"duration"`
+	CleanOldReclaimDuration     string `validate:"duration"`
+	MaxReclaimAttempts          int
+	ReclaimCount                int64
 	ReclaimMaxExponentialFactor int
-	// DLQ handler enables handling messages that are sent to a Dead Letter Queue (DLQ).
-	DLQHandler DLQHandlerFn
-	// IgnoreDLQHandlerErrors enables ignoring errors that occur when handling messages in a DLQ handler.
-	IgnoreDLQHandlerErrors bool
 
-	// DropConcurrentDuplicates enables dropping duplicate messages if they arrive in nearly the same time.
+	DLQHandler               DLQHandlerFn
+	IgnoreDLQHandlerErrors   bool
 	DropConcurrentDuplicates bool
+
+	ProcessedIdsMaxAgeStr string `validate:"duration"`
 }
 
+// RedisStream is the main struct implementing IRedStream.
 type RedisStream struct {
 	Client redis.Cmdable
 	Rs     *redsync.Redsync
@@ -65,6 +55,7 @@ type RedisStream struct {
 	BlockDuration           time.Duration
 	ReclaimInterval         time.Duration
 	CleanOldReclaimDuration time.Duration
+	ProcessedIdsMaxAge      time.Duration
 
 	handler func(ctx context.Context, msg map[string]string) error
 
@@ -72,38 +63,41 @@ type RedisStream struct {
 	infoLogger  LogFn
 	errorLogger LogFn
 
-	concurrencyCh chan struct{}
+	concurrencyCh   chan struct{}
+	noProgressCount int // # times we saw zero reclaims in a row
+
+	luaScripts *lua.Scripts
 }
 
 // New creates and initializes a new IRedStream instance.
 //
-// It sets up a Redis client, initializes a distributed lock using redsync,
-// and configures various timing parameters based on the provided configuration.
-// It also creates a consumer group if it doesn't already exist.
+// It sets up the Redis client, configures distributed locking if enabled,
+// parses and validates configuration values, creates the consumer group if it doesn't exist,
+// and registers Lua scripts.
 //
 // Parameters:
-//   - redisOptions: A pointer to redis.Options, containing Redis connection details.
-//   - cfg: A Config struct containing configuration parameters for the stream.
+//   - redisOptions: A pointer to redis.UniversalOptions containing Redis connection settings.
+//   - cfg: A Config struct containing the configuration for the RedStream.
 //
 // Returns:
-//
-//	An IRedStream interface implementation if successful, or nil if there's an error
-//	in validating the configuration or setting up the consumer group.
+//   - An IRedStream interface implementation. If there's an error during initialization,
+//     it returns nil and logs a fatal error.
 func New(redisOptions *redis.UniversalOptions, cfg Config) IRedStream {
 	client := redis.NewUniversalClient(redisOptions)
-	rs := redsync.New(redsyncredis.NewPool(client))
+	var rs *redsync.Redsync
+	if cfg.UseDistributedLock {
+		rs = redsync.New(redsyncredis.NewPool(client))
+	}
 
+	// parse durations with fallback defaults
 	lockExpiry := ParseDurationOrDefault(&cfg.LockExpiryStr, 10*time.Second)
 	lockExtend := ParseDurationOrDefault(&cfg.LockExtendStr, lockExpiry/2)
 	blockDuration := ParseDurationOrDefault(&cfg.BlockDurationStr, 5*time.Second)
 	reclaimInterval := ParseDurationOrDefault(&cfg.ReclaimStr, 5*time.Second)
 	cleanOldReclaimDuration := ParseDurationOrDefault(&cfg.CleanOldReclaimDuration, 1*time.Hour)
+	processedIdsMaxAge := ParseDurationOrDefault(&cfg.ProcessedIdsMaxAgeStr, 24*time.Hour)
 
-	err := Validate.Struct(cfg)
-	if err != nil {
-		return nil
-	}
-
+	// validate or fix defaults
 	if cfg.MaxReclaimAttempts <= 0 {
 		cfg.MaxReclaimAttempts = 3
 	}
@@ -116,47 +110,60 @@ func New(redisOptions *redis.UniversalOptions, cfg Config) IRedStream {
 	if cfg.MaxConcurrency <= 0 {
 		cfg.MaxConcurrency = 10
 	}
-	if lockExtend >= lockExpiry {
-		log.Fatalf("Lock extend interval (%v) must be < lock expiry (%v)", lockExtend, lockExpiry)
+	if cfg.NoProgressThreshold <= 0 {
+		cfg.NoProgressThreshold = 3 // default: 3 consecutive zero-reclaims
 	}
-	if lockExtend < time.Duration(0.2*float64(lockExpiry)) {
-		log.Fatalf("Lock extend interval (%v) must be >= 20%% of expiry (%v)", lockExtend, lockExpiry)
+
+	// only relevant if using distributed lock
+	if cfg.UseDistributedLock {
+		if lockExtend >= lockExpiry {
+			log.Fatalf("Lock extend interval (%v) must be < lock expiry (%v)", lockExtend, lockExpiry)
+		}
+		if lockExtend < time.Duration(0.2*float64(lockExpiry)) {
+			log.Fatalf("Lock extend interval (%v) must be >= 20%% of expiry (%v)", lockExtend, lockExpiry)
+		}
 	}
-	if err = CreateGroupIfNotExists(client, cfg.StreamName, cfg.GroupName); err != nil {
+
+	if err := Validate.Struct(cfg); err != nil {
+		return nil
+	}
+
+	// create group if not exist
+	if err := CreateGroupIfNotExists(client, cfg.StreamName, cfg.GroupName); err != nil {
 		log.Fatalf("Failed to create consumer group: %v", err)
+	}
+
+	ctx := context.Background()
+
+	scripts, errLoad := lua.RegisterLuaScripts(ctx, client)
+	if errLoad != nil {
+		log.Fatalf("Error registering Lua scripts: %v", errLoad)
 	}
 
 	return &RedisStream{
 		Client:                  client,
 		Rs:                      rs,
 		Cfg:                     cfg,
+		luaScripts:              scripts,
 		LockExpiry:              lockExpiry,
 		LockExtend:              lockExtend,
 		BlockDuration:           blockDuration,
 		ReclaimInterval:         reclaimInterval,
 		CleanOldReclaimDuration: cleanOldReclaimDuration,
+		ProcessedIdsMaxAge:      processedIdsMaxAge,
 	}
 }
 
-// UseDebug sets a custom debug logger for the IRedStream instance.
+// RegisterHandler sets the handler for new messages.
+func (r *RedisStream) RegisterHandler(handler func(ctx context.Context, msg map[string]string) error) {
+	r.handler = handler
+}
+
 func (r *RedisStream) UseDebug(fn LogFn) { r.debugLogger = fn }
-
-// UseInfo sets a custom info logger for the IRedStream instance.
-func (r *RedisStream) UseInfo(fn LogFn) { r.infoLogger = fn }
-
-// UseError sets a custom error logger for the IRedStream instance.
+func (r *RedisStream) UseInfo(fn LogFn)  { r.infoLogger = fn }
 func (r *RedisStream) UseError(fn LogFn) { r.errorLogger = fn }
 
-// debug logs debug-level messages using the configured debug logger or falls back to standard logging.
-//
-// It first checks if a custom debug logger is set. If so, it uses that logger to log the message.
-// Otherwise, it falls back to using the standard log package.
-//
-// Parameters:
-//   - ctx: The context.Context for the logging operation.
-//   - args: Variadic parameter for the log message and any additional values to be logged.
-//
-// The function does not return any value.
+// debug logs [DEBUG] + your message
 func (r *RedisStream) debug(ctx context.Context, args ...interface{}) {
 	if r.debugLogger != nil {
 		_ = r.debugLogger(ctx, args...)
@@ -166,16 +173,7 @@ func (r *RedisStream) debug(ctx context.Context, args ...interface{}) {
 	}
 }
 
-// info logs info-level messages using the configured info logger or falls back to standard logging.
-//
-// It first checks if a custom info logger is set. If so, it uses that logger to log the message.
-// Otherwise, it falls back to using the standard log package.
-//
-// Parameters:
-//   - ctx: The context.Context for the logging operation.
-//   - args: Variadic parameter for the log message and any additional values to be logged.
-//
-// The function does not return any value.
+// info logs [INFO] + your message
 func (r *RedisStream) info(ctx context.Context, args ...interface{}) {
 	if r.infoLogger != nil {
 		_ = r.infoLogger(ctx, args...)
@@ -185,16 +183,7 @@ func (r *RedisStream) info(ctx context.Context, args ...interface{}) {
 	}
 }
 
-// err logs error-level messages using the configured error logger or falls back to standard logging.
-//
-// It first checks if a custom error logger is set. If so, it uses that logger to log the message.
-// Otherwise, it falls back to using the standard log package.
-//
-// Parameters:
-//   - ctx: The context.Context for the logging operation.
-//   - args: Variadic parameter for the log message and any additional values to be logged.
-//
-// The function does not return any value.
+// err logs [ERROR] + your message
 func (r *RedisStream) err(ctx context.Context, args ...interface{}) {
 	if r.errorLogger != nil {
 		_ = r.errorLogger(ctx, args...)
@@ -204,21 +193,18 @@ func (r *RedisStream) err(ctx context.Context, args ...interface{}) {
 	}
 }
 
-// RegisterHandler registers a handler function that will be called when a new message is received.
-func (r *RedisStream) RegisterHandler(handler func(ctx context.Context, msg map[string]string) error) {
-	r.handler = handler
-}
-
-// Publish adds a new message to the Redis stream. It optionally checks for concurrent duplicates
-// before publishing, based on the configuration.
+// Publish adds a new message to the Redis stream. It optionally checks for and drops concurrent duplicates.
+//
+// The function marshals the provided data into JSON, optionally acquires a lock to prevent concurrent duplicates,
+// and then adds the message to the stream using Redis XADD command.
 //
 // Parameters:
 //   - ctx: A context.Context for handling cancellation and timeouts.
-//   - data: Any data type that can be marshaled into JSON.
+//   - data: Any data type that can be marshaled into JSON to be published as a message.
 //
 // Returns:
-//   - string: The ID of the published message in the Redis stream. Empty if a duplicate is detected.
-//   - error: An error if the publish operation fails, or nil if successful.
+//   - string: The ID of the published message in the Redis stream. Empty if skipped due to duplication.
+//   - error: An error if any step in the publishing process fails, nil otherwise.
 func (r *RedisStream) Publish(ctx context.Context, data any) (string, error) {
 	raw, err := json.Marshal(data)
 	if err != nil {
@@ -226,18 +212,22 @@ func (r *RedisStream) Publish(ctx context.Context, data any) (string, error) {
 	}
 
 	if r.Cfg.DropConcurrentDuplicates {
-		// Increase lock expiry to 500ms (vs. 100ms) to reduce chance of missing duplicates
 		publishLockStr := publishLockKey(r.Cfg.StreamName, raw)
-		pubLock := r.Rs.NewMutex(publishLockStr, redsync.WithExpiry(500*time.Millisecond), redsync.WithTries(1))
-		if e := pubLock.LockContext(ctx); e != nil {
-			r.debug(ctx, "concurrency duplicate lock taken:", publishLockStr)
-			return "", nil
-		}
-		defer func() {
-			if _, uErr := pubLock.Unlock(); uErr != nil {
-				r.err(ctx, "ephemeral publish lock unlock error:", uErr)
+		if r.Rs != nil { // only if lock is enabled
+			pubLock := r.Rs.NewMutex(publishLockStr,
+				redsync.WithExpiry(500*time.Millisecond),
+				redsync.WithTries(1),
+			)
+			if e := pubLock.LockContext(ctx); e != nil {
+				r.debug(ctx, "duplicate lock taken, skipping publish:", publishLockStr)
+				return "", nil
 			}
-		}()
+			defer func() {
+				if _, uErr := pubLock.Unlock(); uErr != nil {
+					r.err(ctx, "ephemeral publish lock unlock error:", uErr)
+				}
+			}()
+		}
 	}
 
 	args := &redis.XAddArgs{
@@ -246,27 +236,27 @@ func (r *RedisStream) Publish(ctx context.Context, data any) (string, error) {
 	}
 	id, xErr := r.Client.XAdd(ctx, args).Result()
 	if xErr == nil {
-		r.debug(ctx, "Published", id, string(raw))
+		r.debug(ctx, "Published =>", id, string(raw))
 	}
 	return id, xErr
 }
 
-// StartConsumer initiates the consumer process for the Redis stream.
-// It starts two goroutines: one for listening to new messages and another for
-// reclaiming pending messages (if enabled in the configuration).
+// StartConsumer initiates the consumer process for the Redis stream. It starts
+// goroutines for listening to new messages, reclaiming pending messages (if enabled),
+// and performing periodic cleanup of processed message IDs.
+//
+// This function sets up the necessary channels and goroutines to handle message
+// processing concurrency, new message consumption, and maintenance tasks.
 //
 // Parameters:
-//   - ctx: A context.Context for managing the lifecycle of the consumer goroutines.
-//     It can be used to cancel the consumer operations.
+//   - ctx: A context.Context for handling cancellation and timeouts.
 //
 // Returns:
-//   - error: Returns error if handler is not set.
+//   - error: An error if the handler function is not set, nil otherwise.
 func (r *RedisStream) StartConsumer(ctx context.Context) error {
 	if r.handler == nil {
 		return fmt.Errorf("handler function not set")
 	}
-
-	// Optional concurrency limit
 	if r.Cfg.MaxConcurrency > 0 {
 		r.concurrencyCh = make(chan struct{}, r.Cfg.MaxConcurrency)
 	}
@@ -277,19 +267,83 @@ func (r *RedisStream) StartConsumer(ctx context.Context) error {
 		go r.autoClaimLoop(ctx)
 	}
 
+	// rolling cleanup for processed IDs every 10m
+	go func() {
+		ticker := time.NewTicker(10 * time.Minute)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				r.cleanupProcessedIDs(ctx)
+			}
+		}
+	}()
+
 	return nil
 }
 
-// listenNewMessages continuously listens for new messages in the Redis stream.
-// It uses XReadGroup to read messages from the stream and processes each message
-// in a separate goroutine. This function runs indefinitely until the context is cancelled.
+// readPendingMessagesOnce reads and processes pending messages for the current consumer
+// from the beginning of the stream (ID "0"). It continues reading messages in batches
+// until there are no more pending messages or an error occurs.
+//
+// This function is typically used to reprocess messages that might have been left
+// unacknowledged due to consumer failures or restarts.
 //
 // Parameters:
-//   - ctx: A context.Context for cancellation and timeout control. When this context
-//     is cancelled, the function will return.
+//   - ctx: A context.Context for handling cancellation and timeouts.
 //
-// The function does not return any value. It runs as a long-lived goroutine,
-// processing messages until the context is cancelled.
+// The function doesn't return any value, but it processes messages and handles errors internally.
+func (r *RedisStream) readPendingMessagesOnce(ctx context.Context) {
+	for {
+		streams, err := r.Client.XReadGroup(ctx, &redis.XReadGroupArgs{
+			Group:    r.Cfg.GroupName,
+			Consumer: r.Cfg.ConsumerName,
+			Streams:  []string{r.Cfg.StreamName, "0"},
+			Count:    r.Cfg.ReclaimCount,
+			Block:    r.BlockDuration,
+		}).Result()
+
+		if errors.Is(err, redis.Nil) {
+			r.debug(ctx, "No more old pending for consumer:", r.Cfg.ConsumerName)
+			return
+		}
+		if err != nil {
+			r.err(ctx, "XReadGroup re-check error:", err)
+			return
+		}
+
+		count := 0
+		for _, s := range streams {
+			for _, msg := range s.Messages {
+				count++
+				go r.processMessage(ctx, msg)
+			}
+		}
+
+		// if we got fewer than ReclaimCount => we're done
+		if int64(count) < r.Cfg.ReclaimCount {
+			return
+		}
+	}
+}
+
+// listenNewMessages continuously listens for new messages in the Redis stream
+// and processes them asynchronously. It uses XREADGROUP with the ">" identifier
+// to read only new messages that haven't been delivered to any other consumer
+// in the same consumer group.
+//
+// This function runs in an infinite loop until the context is cancelled. It
+// blocks for a specified duration while waiting for new messages, and when
+// messages are received, it spawns a new goroutine to process each message.
+//
+// Parameters:
+//   - ctx: A context.Context for handling cancellation and timeouts.
+//
+// The function doesn't return any value, but it continues to run until the
+// context is cancelled.
 func (r *RedisStream) listenNewMessages(ctx context.Context) {
 	for {
 		select {
@@ -297,7 +351,6 @@ func (r *RedisStream) listenNewMessages(ctx context.Context) {
 			return
 		default:
 		}
-
 		streams, err := r.Client.XReadGroup(ctx, &redis.XReadGroupArgs{
 			Group:    r.Cfg.GroupName,
 			Consumer: r.Cfg.ConsumerName,
@@ -309,35 +362,30 @@ func (r *RedisStream) listenNewMessages(ctx context.Context) {
 		if errors.Is(err, redis.Nil) {
 			continue
 		}
-
 		if err != nil {
 			r.err(ctx, "XReadGroup error:", err)
 			continue
 		}
 
 		for _, s := range streams {
-			for _, message := range s.Messages {
-				go r.processMessage(ctx, message)
+			for _, msg := range s.Messages {
+				go r.processMessage(ctx, msg)
 			}
 		}
 	}
 }
 
-// autoClaimLoop runs a continuous loop that periodically attempts to reclaim pending messages
-// from the Redis stream. It uses a ticker to trigger reclaim attempts at regular intervals
-// defined by the ReclaimInterval configuration.
+// autoClaimLoop runs a periodic reclaim process for pending messages in the Redis stream.
+// It continuously attempts to reclaim and process messages that have not been acknowledged
+// within the specified reclaim interval.
 //
-// This function is intended to be run as a goroutine and will continue until the provided
-// context is cancelled.
+// The function runs indefinitely until the provided context is cancelled.
 //
 // Parameters:
-//   - ctx: A context.Context that controls the lifecycle of the loop. When this context
-//     is cancelled, the function will return, stopping the auto-claim process.
+//   - ctx: A context.Context for handling cancellation and timeouts.
 //
-// The function does not return any value.
+// This function does not return any value.
 func (r *RedisStream) autoClaimLoop(ctx context.Context) {
-	// Fire a small internal ticker (e.g. every second) but only do "heavy reclaim"
-	// if ReclaimInterval has elapsed. This prevents the spam you see in logs.
 	t := time.NewTicker(r.ReclaimInterval)
 	defer t.Stop()
 
@@ -352,335 +400,372 @@ func (r *RedisStream) autoClaimLoop(ctx context.Context) {
 }
 
 // processMessage handles the processing of a single message from the Redis stream.
-// It acquires a lock, executes the user-defined handler, and manages the message
-// lifecycle based on the handler's success or failure.
+// It manages concurrency, calls the user-defined handler, and performs skip or process
+// operations based on the message status and handler result.
 //
-// The function performs the following steps:
-//  1. Extracts the JSON content from the message.
-//  2. Acquires a distributed lock for the message.
-//  3. Executes the user-defined handler.
-//  4. Based on the handler's result, either acknowledges and deletes the message,
-//     or increments the attempt count for failed messages.
-//  5. Releases the lock.
+// The function follows these steps:
+// 1. Manages concurrency using a channel if configured.
+// 2. Converts message fields and checks for required 'json' field.
+// 3. Calls the user-defined handler if set.
+// 4. Handles message failure or processes the message using a Lua script.
 //
 // Parameters:
-//   - ctx: A context.Context for cancellation and timeout control.
+//   - ctx: A context.Context for handling cancellation and timeouts.
 //   - msg: A redis.XMessage containing the message data from the Redis stream.
 //
-// The function does not return any value. It logs various stages of message
-// processing using the RedisStream's logging methods.
+// The function doesn't return any value but handles message processing internally,
+// including error logging and debug information.
 func (r *RedisStream) processMessage(ctx context.Context, msg redis.XMessage) {
-	// Optional concurrency limit
 	if r.concurrencyCh != nil {
 		r.concurrencyCh <- struct{}{}
 		defer func() { <-r.concurrencyCh }()
 	}
 
+	// (A) Possibly call user handler first to see if success/fail
+	// Alternatively, you can do the "skip check" first.
+	// Below, we'll do the user handler first for a typical flow.
+
+	// 1) Convert fields
 	fields := convertFields(msg.Values)
-	jsonString, ok := fields["json"]
+	_, ok := fields["json"]
 	if !ok {
-		r.err(ctx, "missing 'json' field in message:", msg)
+		r.err(ctx, "missing 'json' field:", msg)
 		return
 	}
 
-	lockKey := streamLockKey(r.Cfg.StreamName, jsonString)
-	mutex := r.Rs.NewMutex(lockKey, redsync.WithExpiry(r.LockExpiry), redsync.WithTries(1))
-	if err := mutex.LockContext(ctx); err != nil {
-		return
-	}
-	r.debug(ctx, "acquired for msg:", msg)
-
-	// We create a context we can cancel if the lock extension fails
-	extendCtx, extendCancel := context.WithCancel(ctx)
-	go r.extendLockLoop(extendCtx, msg.ID, mutex, extendCancel)
-
+	// 2) User-defined handler
 	var handlerErr error
 	if r.handler != nil {
-		handlerErr = r.handler(extendCtx, fields)
+		handlerErr = r.handler(ctx, fields)
 	}
 
-	attemptsKeyStr := reclaimAttemptsKey(r.Cfg)
-	pipe := r.Client.Pipeline()
+	// 3) Build Lua call arguments
+	// skipOrProcess.lua => we either "skip" if in ZSET, or if not in ZSET, do XACK+XDEL+ZADD
+	// We also consider success or fail.
+	// If fail => we skip the "ZADD" portion.
+	// => We'll do a minor tweak: if handlerErr != nil, we won't call skipOrProcess, we'll call handleFail instead.
 
-	if handlerErr == nil {
-		// Success => ACK & delete
-		r.ackAndDelete(ctx, pipe, msg.ID)
-		_, _ = pipe.HDel(ctx, attemptsKeyStr,
-			msg.ID,
-			msg.ID+":count",
-			msg.ID+":ts",
-			msg.ID+":nextBackoffSec",
-		).Result()
-
-		if _, err := pipe.Exec(ctx); err != nil {
-			r.err(ctx, "ackAndDelete fail:", msg, err)
-		} else {
-			r.debug(ctx, "success & deleted msg:", msg)
-		}
-
-	} else {
-		// Failure => increment attempt count
-		nowSec := time.Now().Unix()
-		countKey := msg.ID + ":count"
-		tsKey := msg.ID + ":ts"
-		backoffKey := msg.ID + ":nextBackoffSec"
-
-		newCount, _ := pipe.HIncrBy(ctx, attemptsKeyStr, countKey, 1).Result()
-		if newCount > int64(r.Cfg.MaxReclaimAttempts) {
-			var dlqHandlerErr error
-			isDLQHandlerSet := r.Cfg.DLQHandler != nil
-
-			if isDLQHandlerSet {
-				dlqHandlerErr = r.Cfg.DLQHandler(extendCtx, &msg)
-				if dlqHandlerErr != nil {
-					r.err(ctx, "DLQ handler fail:", msg, dlqHandlerErr)
-				}
-			} else {
-				r.err(ctx, "DLQ handler not set")
-			}
-
-			isDLQHandlerSuccessful := dlqHandlerErr == nil
-			shouldIgnoreDLQErrors := r.Cfg.IgnoreDLQHandlerErrors
-			shouldRemove := !isDLQHandlerSet || (isDLQHandlerSuccessful || shouldIgnoreDLQErrors)
-
-			if shouldRemove {
-				r.err(ctx, "msg exceeded attempts:", msg, handlerErr)
-				r.ackAndDelete(ctx, pipe, msg.ID)
-				_, _ = pipe.HDel(ctx, attemptsKeyStr,
-					msg.ID,
-					countKey,
-					tsKey,
-					backoffKey,
-				).Result()
-			}
-		} else {
-			r.err(ctx, "handler fail for msg:", msg, handlerErr)
-			// We do NOT ack => remains in PEL
-			_, _ = pipe.HSet(ctx, attemptsKeyStr, tsKey, nowSec).Result()
-
-			// Exponential backoff
-			factor := 1 << newCount
-			if factor > r.Cfg.ReclaimMaxExponentialFactor {
-				factor = r.Cfg.ReclaimMaxExponentialFactor
-			}
-			nextBackoffSec := nowSec + int64(r.ReclaimInterval.Seconds())*int64(factor)
-			_, _ = pipe.HSet(ctx, attemptsKeyStr, backoffKey, nextBackoffSec).Result()
-		}
-
-		if _, pipeErr := pipe.Exec(ctx); pipeErr != nil {
-			r.err(ctx, "process fail:", msg, pipeErr)
-		}
+	if handlerErr != nil {
+		// we fail => handleFail in 1 atomic call
+		r.handleFail(ctx, msg, handlerErr)
+		return
 	}
 
-	// Stop the lock-extension goroutine
-	extendCancel()
+	// if success => call skipOrProcess, but specifically we want to mark "processed"
+	// We'll pass a separate arg so the script knows we want to "mark processed" not just "skip check".
+	// For simplicity, let's do the skip-check anyway (in case we didn't do it earlier).
+	skipOrProcessRes, err := r.Client.EvalSha(
+		ctx,
+		r.luaScripts.SkipOrProcessSha,
+		[]string{
+			processedSetKey(r.Cfg), // KEYS[1] => processedZsetKey
+			r.Cfg.StreamName,       // KEYS[2] => stream name
+			r.Cfg.GroupName,        // KEYS[3] => group name
+		},
+		// ARGV
+		uniqueIDForMessage(r.Cfg, msg.ID),             // ARGV[1] => unique ID in ZSET
+		fmt.Sprintf("%f", float64(time.Now().Unix())), // ARGV[2] => Score (current time)
+		msg.ID, // ARGV[3] => Redis message ID
+	).Result()
 
-	if _, uErr := mutex.Unlock(); uErr != nil {
-		r.err(ctx, "unlock fail for msg:", msg, uErr)
+	if err != nil {
+		// fallback or log error
+		r.err(ctx, "skipOrProcess script error => fallback ack?", err)
+		// You might do a fallback XACK+XDEL, but that might cause duplicates. Up to you.
+		return
+	}
+
+	switch skipOrProcessRes {
+	case "skip":
+		// means we already processed it => nothing more to do
+		r.debug(ctx, "skip => already processed =>", msg.ID)
+	case "processed":
+		// The script has done XACK+XDEL + ZADD => we're good
+		r.debug(ctx, "processed => script ack+del =>", msg.ID)
+	default:
+		r.err(ctx, "unknown result from skipOrProcess =>", skipOrProcessRes)
 	}
 }
 
-// extendLockLoop continuously extends the lock for a message being processed.
-// It runs in a separate goroutine and periodically attempts to extend the lock
-// until the context is cancelled or an error occurs during extension.
+// handleFail processes a failed message by incrementing its attempt count and
+// determining whether to move it to a Dead Letter Queue (DLQ) or keep it in the
+// Pending Entries List (PEL) with a backoff.
+//
+// The function uses a Lua script to atomically handle the failure, which includes
+// incrementing attempts, potentially acknowledging and deleting the message if
+// attempts are exceeded, and setting a backoff if the message remains in the PEL.
 //
 // Parameters:
-//   - ctx: A context.Context for cancellation control. When this context
-//     is cancelled, the function will return, stopping the lock extension process.
-//   - msgID: A string representing the ID of the message being processed.
-//     This is used for logging purposes.
-//   - m: A pointer to a redsync.Mutex representing the distributed lock
-//     that needs to be extended.
+//   - ctx: A context.Context for handling cancellation and timeouts.
+//   - msg: The redis.XMessage that failed processing.
+//   - handlerErr: The error that occurred during message processing.
 //
-// The function does not return any value. It runs as a long-lived goroutine,
-// extending the lock at regular intervals until the context is cancelled or
-// an error occurs.
+// The function doesn't return any value but handles the failed message internally,
+// including potential DLQ operations and error logging.
+func (r *RedisStream) handleFail(ctx context.Context, msg redis.XMessage, handlerErr error) {
+	attemptsKey := reclaimAttemptsKey(r.Cfg)
+	nowSec := time.Now().Unix()
+
+	// We'll pass some arguments the script needs
+	// handleFail.lua =>
+	// KEYS[1] => attemptsKey
+	// KEYS[2] => streamName
+	// KEYS[3] => groupName
+	// ARGV[1] => msg.ID
+	// ARGV[2] => r.Cfg.MaxReclaimAttempts
+	// ARGV[3] => nowSec
+	// ARGV[4] => (optional) we can pass ReclaimMaxExponentialFactor or base backoff, if the script is using it.
+	// We'll keep it simple and not do full code there.
+
+	// We'll do a quick "DLQHandler" approach in the script if needed.
+	// Or we can do a partial approach: if script returns "exceeded", we do a separate DLQ call.
+
+	scriptRes, err := r.Client.EvalSha(ctx,
+		r.luaScripts.HandleFailSha,
+		[]string{
+			attemptsKey,
+			r.Cfg.StreamName,
+			r.Cfg.GroupName,
+		},
+		msg.ID,
+		fmt.Sprintf("%d", r.Cfg.MaxReclaimAttempts),
+		fmt.Sprintf("%d", nowSec),
+		// we could pass more if needed
+	).Result()
+
+	if err != nil {
+		r.err(ctx, "handleFail script error =>", err)
+		return
+	}
+
+	switch scriptRes {
+	case "exceeded":
+		// The script did XACK+XDEL and removed attempts fields
+		r.err(ctx, "msg exceeded attempts => removed from stream:", msg, handlerErr)
+		// if we want to do a go-level DLQHandler call here:
+		if r.Cfg.DLQHandler != nil {
+			dlqErr := r.Cfg.DLQHandler(ctx, &msg)
+			if dlqErr != nil && !r.Cfg.IgnoreDLQHandlerErrors {
+				r.err(ctx, "DLQ handler fail => message stays removed though, or revert? up to design", dlqErr)
+			}
+		}
+	default:
+		// e.g. "failed" => script set nextBackoff => remain in PEL
+		r.err(ctx, "handler fail => remain in PEL =>", scriptRes, msg, handlerErr)
+	}
+}
+
+// extendLockLoop periodically extends the distributed lock for a message until the context is cancelled or the lock extension fails.
+// It runs in a separate goroutine to maintain the lock while the message is being processed.
+//
+// Parameters:
+//   - ctx: A context.Context for handling cancellation and timeouts.
+//   - msgID: A string representing the ID of the message being processed.
+//   - m: A pointer to a redsync.Mutex representing the distributed lock.
+//   - cancel: A context.CancelFunc to cancel the parent context if lock extension fails.
+//
+// The function doesn't return any value but continues to extend the lock until the context is done or an error occurs.
 func (r *RedisStream) extendLockLoop(ctx context.Context, msgID string, m *redsync.Mutex, cancel context.CancelFunc) {
-	ticker := time.NewTicker(r.LockExtend)
-	defer ticker.Stop()
+	tick := time.NewTicker(r.LockExtend)
+	defer tick.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
+		case <-tick.C:
 			ok, err := m.ExtendContext(ctx)
 			if err != nil || !ok {
-				r.err(ctx, "lock extend fail for msg:", msgID, err)
-				// Cancel so the handler code can end
+				r.err(ctx, "lock extend fail => stopping for msg:", msgID, err)
 				cancel()
 				return
 			}
-			r.debug(ctx, "extended for msg:", msgID)
+			r.debug(ctx, "lock extended for msg:", msgID)
 		}
 	}
 }
 
-// reclaimPending attempts to reclaim pending messages from the Redis stream.
-// It uses XAUTOCLAIM to fetch pending messages, processes them, and manages
-// the reclaim attempts count. This function also implements a distributed lock
-// to ensure only one worker performs the reclaim operation at a time.
+// reclaimPending attempts to reclaim and process pending messages in the Redis stream.
+// It uses XAUTOCLAIM to fetch pending messages, processes them if they're not in backoff,
+// and manages the reclaim process state. If no messages are reclaimed for a certain number
+// of attempts, it triggers a full pending message read.
 //
-// The function performs the following steps:
-// 1. Acquires a distributed lock to ensure exclusive reclaim operation.
-// 2. Checks if sufficient time has passed since the last reclaim operation.
-// 3. Uses XAUTOCLAIM to fetch pending messages.
-// 4. Processes each claimed message, either by reprocessing or acknowledging and deleting.
-// 5. Updates the next start ID for future reclaim operations.
-// 6. Updates the last reclaim time.
-// 7. Cleans up old reclaim records.
+// The function optionally uses a distributed lock to ensure only one node performs the reclaim
+// operation at a time. It also manages the next start ID for subsequent reclaim operations
+// and cleans up old reclaim records.
 //
 // Parameters:
-//   - ctx: A context.Context for cancellation and timeout control.
-//     It is used for all Redis operations and message processing.
+//   - ctx: A context.Context for handling cancellation and timeouts.
 //
-// The function does not return any value. It logs various stages of the reclaim
-// process using the RedisStream's logging methods.
+// The function doesn't return any value but processes reclaimed messages internally
+// and updates the reclaim state.
 func (r *RedisStream) reclaimPending(ctx context.Context) {
-	reclaimLock := r.Rs.NewMutex(
-		reclaimLockKey(r.Cfg),
-		redsync.WithExpiry(r.LockExpiry),
-		redsync.WithTries(1),
-	)
-	if err := reclaimLock.LockContext(ctx); err != nil {
-		// Another process holds the reclaim lock
-		return
-	}
-	defer func() {
-		if _, uErr := reclaimLock.Unlock(); uErr != nil {
-			r.err(ctx, "unlock fail reclaim-lock:", uErr)
+	if r.Rs != nil && r.Cfg.UseDistributedLock {
+		// we do a small lock to ensure only 1 node reclaims
+		reclaimLock := r.Rs.NewMutex(
+			reclaimLockKey(r.Cfg),
+			redsync.WithExpiry(r.LockExpiry),
+			redsync.WithTries(1),
+		)
+		if err := reclaimLock.LockContext(ctx); err != nil {
+			return
 		}
-	}()
-
-	reclaimNextStartKeyStr := reclaimNextStartKey(r.Cfg)
-	storedStart, _ := r.Client.Get(ctx, reclaimNextStartKeyStr).Result()
-	if storedStart == "" {
-		storedStart = "0-0"
+		defer func() {
+			if _, uErr := reclaimLock.Unlock(); uErr != nil {
+				r.err(ctx, "unlock fail reclaim-lock:", uErr)
+			}
+		}()
 	}
 
-	attemptsKeyStr := reclaimAttemptsKey(r.Cfg)
-	startID := storedStart
+	startKey := reclaimNextStartKey(r.Cfg)
+	stored, _ := r.Client.Get(ctx, startKey).Result()
+	if stored == "" {
+		stored = "0-0"
+	}
 
-	// Keep calling XAutoClaim until no more big chunks left
+	attemptsKey := reclaimAttemptsKey(r.Cfg)
+	startID := stored
+
+	totalReclaimed := 0
+
 	for {
 		claimed, newNextStart, err := r.Client.XAutoClaim(ctx, &redis.XAutoClaimArgs{
 			Stream:   r.Cfg.StreamName,
 			Group:    r.Cfg.GroupName,
 			Consumer: r.Cfg.ConsumerName,
-			MinIdle:  r.LockExpiry,
+			MinIdle:  0,
 			Start:    startID,
 			Count:    r.Cfg.ReclaimCount,
 		}).Result()
-
 		if err != nil {
-			r.err(ctx, "XAutoClaim error", err)
+			r.err(ctx, "XAutoClaim error:", err)
 			return
 		}
-		r.debug(ctx, "reclaimed", len(claimed), "messages, next start:", newNextStart)
+		r.debug(ctx, "reclaimed =>", len(claimed), " next =>", newNextStart)
+		totalReclaimed += len(claimed)
 
 		pipe := r.Client.Pipeline()
 
 		for _, m := range claimed {
-			countKey := m.ID + ":count"
-			tsKey := m.ID + ":ts"
 			backoffKey := m.ID + ":nextBackoffSec"
-
-			val, _ := pipe.HGet(ctx, attemptsKeyStr, backoffKey).Result()
+			val, _ := pipe.HGet(ctx, attemptsKey, backoffKey).Result()
 			if val != "" {
 				nextSec, _ := strconv.ParseInt(val, 10, 64)
-				nowSec := time.Now().Unix()
-				if nowSec < nextSec {
-					r.debug(ctx, "skip, still in backoff for msg:", m.ID)
+				if time.Now().Unix() < nextSec {
+					r.debug(ctx, "skip, still in backoff =>", m.ID)
 					continue
 				}
 			}
-
-			newCount, _ := pipe.HIncrBy(ctx, attemptsKeyStr, countKey, 1).Result()
-			_, _ = pipe.HSet(ctx, attemptsKeyStr, tsKey, time.Now().Unix()).Result()
-
-			if newCount > int64(r.Cfg.MaxReclaimAttempts) {
-				r.err(ctx, "msg exceeded attempts:", m.ID)
-				r.ackAndDelete(ctx, pipe, m.ID)
-			} else {
-				// Reprocess in a goroutine (still might want concurrency-limits)
-				go r.processMessage(ctx, m)
-			}
+			// handle once more
+			go r.processMessage(ctx, m)
 		}
 
-		// Update next reclaim start
 		if isGreaterID(newNextStart, startID) {
-			_, _ = pipe.Set(ctx, reclaimNextStartKeyStr, newNextStart, 0).Result()
+			pipe.Set(ctx, startKey, newNextStart, 0)
+		}
+		if _, e := pipe.Exec(ctx); e != nil {
+			r.err(ctx, "reclaim pipeline fail:", e)
 		}
 
-		if _, execErr := pipe.Exec(ctx); execErr != nil {
-			r.err(ctx, "pipeline exec failed:", execErr)
-		}
-
-		// Stop if fewer than Count or ID not advancing
 		if len(claimed) < int(r.Cfg.ReclaimCount) || !isGreaterID(newNextStart, startID) {
 			break
 		}
 		startID = newNextStart
 	}
 
-	// Finally, cleanup old reclaim records
-	r.cleanupOldReclaimRecords(ctx, attemptsKeyStr)
+	// no progress => increment
+	if totalReclaimed == 0 {
+		r.noProgressCount++
+		r.debug(ctx, "no progress => noProgressCount=", r.noProgressCount)
+		if r.noProgressCount >= r.Cfg.NoProgressThreshold {
+			r.debug(ctx, "trigger readPendingMessagesOnce => noProgress")
+			r.readPendingMessagesOnce(ctx)
+			r.noProgressCount = 0
+		}
+	} else {
+		r.noProgressCount = 0
+	}
+
+	r.cleanupOldReclaimRecords(ctx, attemptsKey)
 }
 
-// cleanupOldReclaimRecords removes reclaim records that are older than 1 hour from the Redis hash.
-// This function helps to maintain the reclaim records by removing outdated entries.
+// cleanupOldReclaimRecords removes older attempt records from the Redis hash.
+// It iterates through all fields in the hash, identifies timestamp fields,
+// and removes records that are older than the specified cleanup duration.
 //
 // Parameters:
-//   - ctx: A context.Context for cancellation and timeout control.
-//   - pipe: A redis.Pipeliner for batching Redis commands.
+//   - ctx: A context.Context for handling cancellation and timeouts.
 //   - key: A string representing the Redis key for the hash containing reclaim records.
 //
-// The function does not return any value. It logs errors using the RedisStream's error logger
-// if there's a failure in retrieving the hash entries.
+// The function doesn't return any value but performs cleanup operations internally,
+// removing old records and logging any errors encountered during the process.
 func (r *RedisStream) cleanupOldReclaimRecords(ctx context.Context, key string) {
 	all, err := r.Client.HGetAll(ctx, key).Result()
 	if err != nil {
 		r.err(ctx, "cleanup - HGetAll failed:", err)
 		return
 	}
-
 	nowSec := time.Now().Unix()
-	pipe := r.Client.Pipeline()
 
+	pipe := r.Client.Pipeline()
 	for field, val := range all {
-		// Only handle fields that store a timestamp
 		if strings.HasSuffix(field, ":ts") {
 			ts, convErr := strconv.ParseInt(val, 10, 64)
 			if convErr != nil {
 				continue
 			}
 			if float64(nowSec-ts) > r.CleanOldReclaimDuration.Seconds() {
-				// baseID = msg.ID, e.g. removing "xyz-123:ts" => baseID="xyz-123"
 				baseID := strings.TrimSuffix(field, ":ts")
 				pipe.HDel(ctx, key,
-					field,           // The ts field
-					baseID,          // In case we stored something at baseID
-					baseID+":count", // Attempts count
+					field,
+					baseID,
+					baseID+":count",
 					baseID+":nextBackoffSec",
 				)
 			}
 		}
 	}
-
-	if _, execErr := pipe.Exec(ctx); execErr != nil {
-		r.err(ctx, "pipeline exec failed:", execErr)
+	if _, e := pipe.Exec(ctx); e != nil {
+		r.err(ctx, "cleanup pipeline fail:", e)
 	}
 }
 
-// HealthCheck performs a health check on the Redis connection.
-// It sends a PING command to the Redis server to verify connectivity.
+// HealthCheck performs a health check on the Redis connection by sending a PING command.
+// It verifies if the Redis server is responsive and the connection is active.
 //
 // Parameters:
-//   - ctx: A context.Context for cancellation and timeout control.
+//   - ctx: A context.Context for handling cancellation and timeouts.
 //
 // Returns:
-//   - error: nil if the PING was successful, otherwise an error describing the failure.
+//   - error: An error if the PING command fails or the connection is not healthy,
+//     nil if the health check is successful.
 func (r *RedisStream) HealthCheck(ctx context.Context) error {
 	_, err := r.Client.Ping(ctx).Result()
 	return err
+}
+
+// cleanupProcessedIDs removes processed message IDs from the Redis sorted set
+// that are older than the specified maximum age. This helps to maintain the size
+// of the processed IDs set and remove unnecessary old entries.
+//
+// The function uses ZREMRANGEBYSCORE to remove entries with scores (timestamps)
+// older than the cutoff time determined by ProcessedIdsMaxAge.
+//
+// Parameters:
+//   - ctx: A context.Context for handling cancellation and timeouts.
+//
+// The function doesn't return any value but logs debug information about the
+// number of removed entries and any errors encountered during the cleanup process.
+func (r *RedisStream) cleanupProcessedIDs(ctx context.Context) {
+	k := processedSetKey(r.Cfg)
+	cutoff := float64(time.Now().Add(-r.ProcessedIdsMaxAge).Unix())
+
+	removed, err := r.Client.ZRemRangeByScore(ctx, k, "0", fmt.Sprintf("%f", cutoff)).Result()
+	if err != nil {
+		r.err(ctx, "ZRemRangeByScore error =>", err)
+		return
+	}
+	if removed > 0 {
+		r.debug(ctx, "cleanup => removed", removed, "older than", r.ProcessedIdsMaxAge)
+	}
 }

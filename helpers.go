@@ -79,21 +79,6 @@ func convertFields(in map[string]any) map[string]string {
 	return out
 }
 
-// streamLockKey generates a unique lock key for a Redis stream based on the stream name and JSON string.
-// It creates a SHA256 hash of the JSON string and uses the first 8 bytes of the hash in the key.
-//
-// Parameters:
-//   - stream: The name of the Redis stream.
-//   - jsonStr: A JSON string representing the data to be locked.
-//
-// Returns:
-//
-//	A string representing the unique lock key in the format "<RedisKeysPrefix>::streamLock::<stream>::<hash>".
-func streamLockKey(stream, jsonStr string) string {
-	sum := sha256.Sum256([]byte(jsonStr))
-	return fmt.Sprintf("%s::streamLock::%s::%s", RedisKeysPrefix, stream, hex.EncodeToString(sum[:8]))
-}
-
 // reclaimAttemptsKey generates a Redis key for tracking reclaim attempts for a specific stream.
 // This key is used to store the number of times a reclaim operation has been attempted.
 //
@@ -116,18 +101,6 @@ func reclaimAttemptsKey(cfg Config) string {
 //   - A string representing the Redis key in the format "<RedisKeysPrefix>::<StreamName>::reclaimLock".
 func reclaimLockKey(cfg Config) string {
 	return fmt.Sprintf("%s::%s::reclaimLock", RedisKeysPrefix, cfg.StreamName)
-}
-
-// lastReclaimKey generates a Redis key for storing the timestamp of the last reclaim operation for a specific stream.
-// This key is used to track when the last reclaim operation was performed on the stream.
-//
-// Parameters:
-//   - cfg: A Config struct containing the configuration for the stream, including the StreamName.
-//
-// Returns:
-//   - A string representing the Redis key in the format "<RedisKeysPrefix>::<StreamName>::lastReclaimTime".
-func lastReclaimKey(cfg Config) string {
-	return fmt.Sprintf("%s::%s::lastReclaimTime", RedisKeysPrefix, cfg.StreamName)
 }
 
 // reclaimNextStartKey generates a Redis key for storing the next starting point for reclaim operations on a specific stream.
@@ -156,22 +129,6 @@ func reclaimNextStartKey(cfg Config) string {
 func publishLockKey(name string, raw []byte) string {
 	h := sha256.Sum256(raw)
 	return fmt.Sprintf("%s::%s::publishLockKey::%s", RedisKeysPrefix, name, hex.EncodeToString(h[:]))
-}
-
-// ackAndDelete acknowledges and deletes a message from a Redis stream.
-// It pipelines the XACK and XDEL commands to remove the message from both
-// the Pending Entries List (PEL) and the stream itself.
-//
-// Parameters:
-//   - ctx: The context for the operation, which can be used for cancellation.
-//   - pipe: A Redis pipeliner used to execute multiple Redis commands in a single round-trip.
-//   - msgID: The ID of the message to be acknowledged and deleted.
-//
-// This method does not return any value. The pipeline commands are queued
-// and will be executed when the pipeline is flushed.
-func (r *RedisStream) ackAndDelete(ctx context.Context, pipe redis.Pipeliner, msgID string) {
-	pipe.XAck(ctx, r.Cfg.StreamName, r.Cfg.GroupName, msgID)
-	pipe.XDel(ctx, r.Cfg.StreamName, msgID)
 }
 
 // isGreaterID compares two Redis stream IDs and determines if the first ID is greater than the second.
@@ -227,4 +184,39 @@ func UniqueConsumerName(base string) string {
 	hostname, _ := os.Hostname()
 	suffix := rand.New(rand.NewSource(time.Now().UnixNano())).Intn(int(time.Now().Unix()))
 	return fmt.Sprintf("%s-%s-%d-%d", base, hostname, os.Getpid(), suffix)
+}
+
+// processedSetKey generates a Redis key for storing processed message IDs.
+// This key is used to track which messages have been successfully processed
+// within a specific consumer group and stream.
+//
+// Parameters:
+//   - cfg: A Config struct containing the configuration for the stream,
+//     including the GroupName and StreamName.
+//
+// Returns:
+//
+//	A string representing the Redis key in the format
+//	"<RedisKeysPrefix>:processed:<GroupName>:<StreamName>".
+func processedSetKey(cfg Config) string {
+	return fmt.Sprintf("%s:processed:%s:%s",
+		RedisKeysPrefix, cfg.GroupName, cfg.StreamName)
+}
+
+// uniqueIDForMessage generates a unique identifier for a message within a specific consumer group and stream.
+// This identifier can be used for tracking or referencing messages across different contexts.
+//
+// Parameters:
+//   - cfg: A Config struct containing the configuration for the stream, including GroupName and StreamName.
+//   - msgID: A string representing the unique ID of the message within the Redis stream.
+//
+// Returns:
+//
+//	A string that combines the group name, stream name, and message ID in the format "group|stream|msgID".
+//	This ensures a globally unique identifier for the message across different consumer groups and streams.
+func uniqueIDForMessage(cfg Config, msgID string) string {
+	return fmt.Sprintf("%s|%s|%s",
+		cfg.GroupName,
+		cfg.StreamName,
+		msgID)
 }
