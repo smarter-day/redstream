@@ -12,6 +12,8 @@ A **Golang** library for robust **Redis Streams** consumption with:
 6. **Dead Letter Queue (DLQ)** support for over-limit messages.
 7. **Universal Client** for single-node, cluster, or sentinel setups.
 8. **Concurrency Limit** to throttle simultaneous message handling.
+9. **Automatic stale-consumer removal** (clears out “dead” consumers to reclaim messages).
+10. **Auto-rejoin** if the current consumer was forcibly removed from the group.
 
 ---
 
@@ -42,31 +44,31 @@ func main() {
     ctx := context.Background()
 
     cfg := redstream.Config{
-        StreamName:      "myStream",
-        GroupName:       "myGroup",
-        ConsumerName:    "myConsumer",
-        EnableReclaim:   true,
-        ReclaimStr:      "5s",
-        ReclaimCount:    10,
+        StreamName:         "myStream",
+        GroupName:          "myGroup",
+        ConsumerName:       "myConsumer",
+        EnableReclaim:      true,
+        ReclaimStr:         "5s",
+        ReclaimCount:       10,
         MaxReclaimAttempts: 3,
-        // Control concurrency (optional). If > 0, RedStream limits simultaneous handling.
-        MaxConcurrency:  5,
+        MaxConcurrency:     5, // optional concurrency limit
         // Optional DLQ handler for messages that exceed attempts
-        DLQHandler: func(ctx context.Context, msg *redis.XMessage) error {
-            log.Printf("DLQ got message ID=%s\n", msg.ID)
-            // e.g. write to a separate "errors" stream
+        DLQHandler: func(ctx context.Context, xMsg *redis.XMessage) error {
+            log.Printf("[DLQ] message ID=%s\n", xMsg.ID)
             return nil
         },
+        // (Optional) Auto-remove other stale consumers, rejoin if we're removed
+        EnableStaleConsumerCleanup: true,
+        EnableAutoRejoinOnRemoved:  true,
     }
 
-    // Provide *redis.UniversalOptions for single node, cluster, or sentinel
-    universalOpts := &redis.UniversalOptions{Addrs: []string{"localhost:6379"}}
+    // For single node, cluster, or sentinel
+    uniOpts := &redis.UniversalOptions{Addrs: []string{"localhost:6379"}}
+    stream := redstream.New(uniOpts, cfg)
 
-    stream := redstream.New(universalOpts, cfg)
-
-    // Register a handler that processes messages
-    stream.RegisterHandler(func(ctx context.Context, msg map[string]string) error {
-        // Return an error to test retries or DLQ.
+    // Register your message handler
+    stream.RegisterHandler(func(ctx context.Context, fields map[string]string) error {
+        // Return an error to test the backoff/reclaim. Otherwise, handle your data here.
         return nil
     })
 
@@ -75,11 +77,11 @@ func main() {
     }
 
     // Publish
-    msgID, err := stream.Publish(ctx, map[string]string{"foo": "bar"})
+    msgID, err := stream.Publish(ctx, map[string]any{"foo": "bar"})
     if err != nil {
         log.Println("Publish error:", err)
     } else {
-        log.Println("Published with ID:", msgID)
+        log.Println("Published message ID:", msgID)
     }
 
     // Block forever
@@ -89,64 +91,61 @@ func main() {
 
 ### High-Level Flow
 
-1. **Publish**: By default calls `XADD`. If `DropConcurrentDuplicates=true`, it uses a brief Redsync lock to skip duplicates that arrive almost simultaneously.
-2. **Consume**: Worker(s) call `XREADGROUP`. Each message is protected by a Redsync lock so only one worker processes it. Success => `XACK + XDEL`; failure => attempt tracking & exponential backoff.
-3. **Reclaim**: If `EnableReclaim=true`, a background loop calls `XAUTOCLAIM` to rescue stuck messages. Each is retried until `MaxReclaimAttempts`.
-4. **Concurrency Limit (optional)**: If `MaxConcurrency > 0`, the library throttles simultaneous message processing in each worker, reducing the risk of goroutine overload.
+1. **Publish**: Uses `XADD`. If `DropConcurrentDuplicates=true`, a short Redsync lock can skip near-simultaneous duplicates.
+2. **Consume**: Each message is read with `XREADGROUP`. On success => `XACK + XDEL`; on failure => attempts/backoff. If `UseDistributedLock=true`, only one node processes a given message at a time.
+3. **Reclaim**: A background loop calls `XAUTOCLAIM` to reclaim messages stuck in PEL. Retries until `MaxReclaimAttempts`.
+4. **Stale Consumers**: If `EnableStaleConsumerCleanup=true`, periodically removes consumer names that have been idle beyond `StaleConsumerIdleThresholdStr`, freeing their stuck messages for reclamation.
+5. **Auto-Rejoin**: If `EnableAutoRejoinOnRemoved=true`, a consumer that detects it’s been removed by another node automatically re-joins the group.
+6. **DLQ**: Messages exceeding `MaxReclaimAttempts` go to `DLQHandler` (if set). If `IgnoreDLQHandlerErrors=false`, it’ll remain pending on DLQ errors.
+7. **Concurrency Limit**: With `MaxConcurrency>0`, each consumer instance only processes that many messages simultaneously.
 
 ---
 
 ## Configuration
 
-Configure via `redstream.Config` plus a **`*redis.UniversalOptions`**. Important fields include:
+Configure via `redstream.Config` plus `*redis.UniversalOptions`. Key fields include:
 
-| Field                             | Default                 | Description                                                                                                                                                      |
-|-----------------------------------|-------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| **`StreamName`**                  | **required**            | Redis stream name.                                                                                                                                               |
-| **`GroupName`**                   | **required**            | Consumer group name (auto-created at `0-0` if missing).                                                                                                          |
-| **`ConsumerName`**                | *auto-generated*        | Must be unique across consumers.                                                                                                                                 |
-| **`LockExpiryStr`**               | `"10s"`                 | Redsync lock expiration for message-level locks.                                                                                                                 |
-| **`LockExtendStr`**               | half of `LockExpiryStr` | Interval to keep the lock alive via `ExtendContext`.                                                                                                             |
-| **`BlockDurationStr`**            | `"5s"`                  | How long `XREADGROUP` waits if no new messages arrive.                                                                                                           |
-| **`ReclaimStr`**                  | `"5s"`                  | Frequency of auto-reclaim if `EnableReclaim=true`.                                                                                                               |
-| **`EnableReclaim`**               | `false`                 | Whether to run reclaim logic.                                                                                                                                    |
-| **`CleanOldReclaimDuration`**     | `"1h"`                  | Age threshold for removing stale reclaim records.                                                                                                                |
-| **`MaxReclaimAttempts`**          | `3`                     | After exceeding this, messages are removed or go to DLQ.                                                                                                         |
-| **`ReclaimCount`**                | `10`                    | Number of messages to handle per `XAUTOCLAIM` pass.                                                                                                              |
-| **`ReclaimMaxExponentialFactor`** | `3`                     | Max exponent for backoff. E.g. `factor = min(2^attempts, 8)`.                                                                                                    |
-| **`DLQHandler`**                  | `nil`                   | Optional function for messages beyond `MaxReclaimAttempts`.                                                                                                      |
-| **`IgnoreDLQHandlerErrors`**      | `false`                 | If **true**, remove message even if DLQ fails. Otherwise, keep it pending.                                                                                       |
-| **`DropConcurrentDuplicates`**    | `false`                 | If **true**, ephemeral lock on `Publish(...)` to skip near-simultaneous duplicates.                                                                              |
-| **`MaxConcurrency`**              | `10`                    | If > 0, the library uses a channel-based limit for concurrency in `processMessage`.                                                                              |
-| **`UseRedisIdAsUniqueID`**        | `false`                 | If **true**, - uses redis.XMessage -> ID as unique ID to not repeat processing of duplicates. <br/>Otherwise calculates full sha256 from entire message payload. |
-
-*(Your `*redis.UniversalOptions` can specify single node, cluster, or sentinel.)*
+| Field                              | Default                 | Description                                                                                                                                                            |
+|------------------------------------|-------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| **`StreamName`**                   | **required**            | Redis stream name.                                                                                                                                                     |
+| **`GroupName`**                    | **required**            | Consumer group name (auto-created at `0-0` if missing).                                                                                                                |
+| **`ConsumerName`**                 | *auto-generated*        | Must be unique across consumers.                                                                                                                                        |
+| **`EnableReclaim`**                | `false`                 | Whether to run reclaim logic (XAUTOCLAIM).                                                                                                                             |
+| **`ReclaimStr`**                   | `"5s"`                  | Frequency of auto-reclaim checks.                                                                                                                                      |
+| **`MaxReclaimAttempts`**           | `3`                     | After this many fails, remove or DLQ the message.                                                                                                                      |
+| **`DLQHandler`**                   | `nil`                   | Callback for messages that exceed `MaxReclaimAttempts`.                                                                                                                |
+| **`IgnoreDLQHandlerErrors`**       | `false`                 | If true, remove message even if DLQ fails.                                                                                                                             |
+| **`DropConcurrentDuplicates`**     | `false`                 | Adds a brief Redsync lock on Publish to skip duplicates.                                                                                                               |
+| **`MaxConcurrency`**               | `10`                    | If >0, concurrency is throttled in `processMessage`.                                                                                                                   |
+| **`StaleConsumerIdleThresholdStr`**| `"2m"`                  | Consumers idle longer than this are considered “stale” (if `EnableStaleConsumerCleanup=true`).                                                                          |
+| **`EnableStaleConsumerCleanup`**   | `false`                 | If true, we remove “stale” consumers, letting a healthy consumer reclaim their messages.                                                                               |
+| **`EnableAutoRejoinOnRemoved`**    | `false`                 | If a consumer sees it was removed, it automatically re-joins the group.                                                                                                |
+| **`AutoRejoinCheckIntervalStr`**   | `"30s"`                 | Frequency for checking if our consumer name still exists in the group.                                                                                                 |
+| **`UseRedisIdAsUniqueID`**         | `false`                 | If true, use the Redis `XMessage.ID` for dedup. Otherwise, compute sha256 from message payload.                                                                        |
 
 ---
 
 ## Deeper Explanation & Best Practices
 
 - **Universal Client**:  
-  `redis.NewUniversalClient(...)` lets you toggle between single-node, cluster, or sentinel seamlessly.
-- **Consumer Groups & PEL**:  
-  Redis Streams track unacknowledged messages in a Pending Entries List (PEL). If a consumer crashes, messages remain pending.
-- **Redsync Locking**:  
-  Ensures only one worker (even in a large pool) processes each message. This helps if `XAUTOCLAIM` reassigns the same message to multiple consumers.
+  `redis.NewUniversalClient(...)` works for single-node, cluster, or sentinel modes.
+- **Redsync Locks**:  
+  With `UseDistributedLock=true`, each message is locked so only one node processes it at a time.  
+  With `DropConcurrentDuplicates=true`, `Publish` also uses a tiny ephemeral lock.
+- **Auto-Reclaim**:  
+  Recovers messages left in the Pending Entries List if a consumer crashed.
 - **Exponential Backoff**:  
-  On repeated failures, we store the next earliest time to reprocess each message. If that time is in the future, we skip reprocessing for now.
-- **Dead Letter Queue**:  
-  After `MaxReclaimAttempts`, messages are removed or passed to `DLQHandler`. If `IgnoreDLQHandlerErrors=false`, we keep them in pending if the DLQ fails.
-- **Concurrency Limiting**:  
-  By using `MaxConcurrency`, each consumer instance only handles up to N messages simultaneously. This helps if you have a CPU- or I/O-intensive handler, preventing goroutine overload.
-- **Cleanup**:  
-  Reclaim attempts are stored in a Redis hash. Stale entries older than `CleanOldReclaimDuration` are removed automatically.
-- **Performance Tuning**:  
-  Adjust intervals (`LockExpiryStr`, `ReclaimStr`, etc.) to match your throughput. For large streams, ensure your concurrency and backoff are tuned to avoid overload or excessive retries.
+  Each re-failed message remains in PEL; we store a “nextBackoffSec” so we skip it until it’s ready again.
+- **DLQ**:  
+  Once a message passes `MaxReclaimAttempts`, it’s removed from the stream. Optionally, `DLQHandler` is called.
+- **Stale Consumers**:  
+  If a consumer remains idle beyond `StaleConsumerIdleThresholdStr`, we run `XGROUP DELCONSUMER`, letting other consumers reclaim messages.  
+  A forcibly removed consumer can rejoin if `EnableAutoRejoinOnRemoved=true`.
+- **Fallback**:  
+  If a Lua script fails (e.g. “NOSCRIPT”), you can do a forced `XACK+XDEL` to avoid duplicates stuck in pending.
 
 ---
 
 ## License
 
-[MIT License](LICENSE) – open for adaptation & improvement.
-
-Issues and contributions are always welcome!
+[MIT License](LICENSE) – open for adaptation & improvement. Issues and contributions are always welcome!
