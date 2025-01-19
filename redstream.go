@@ -42,6 +42,7 @@ type Config struct {
 	DropConcurrentDuplicates bool
 
 	ProcessedIdsMaxAgeStr string `validate:"duration"`
+	UseRedisIdAsUniqueID  bool
 }
 
 // RedisStream is the main struct implementing IRedStream.
@@ -454,6 +455,12 @@ func (r *RedisStream) processMessage(ctx context.Context, msg redis.XMessage) {
 	// if success => call skipOrProcess, but specifically we want to mark "processed"
 	// We'll pass a separate arg so the script knows we want to "mark processed" not just "skip check".
 	// For simplicity, let's do the skip-check anyway (in case we didn't do it earlier).
+	messageUniqueId, err := uniqueIDForMessage(r.Cfg, msg)
+	if err != nil {
+		r.err(ctx, "failed to generate unique ID:", err)
+		return
+	}
+
 	skipOrProcessRes, err := r.Client.EvalSha(
 		ctx,
 		r.luaScripts.SkipOrProcessSha,
@@ -463,7 +470,7 @@ func (r *RedisStream) processMessage(ctx context.Context, msg redis.XMessage) {
 			r.Cfg.GroupName,        // KEYS[3] => group name
 		},
 		// ARGV
-		uniqueIDForMessage(r.Cfg, msg.ID),             // ARGV[1] => unique ID in ZSET
+		messageUniqueId, // ARGV[1] => unique ID in ZSET
 		fmt.Sprintf("%f", float64(time.Now().Unix())), // ARGV[2] => Score (current time)
 		msg.ID, // ARGV[3] => Redis message ID
 	).Result()

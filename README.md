@@ -101,24 +101,25 @@ func main() {
 
 Configure via `redstream.Config` plus a **`*redis.UniversalOptions`**. Important fields include:
 
-| Field                              | Default                  | Description                                                                                                                        |
-|------------------------------------|--------------------------|------------------------------------------------------------------------------------------------------------------------------------|
-| **`StreamName`**                   | **required**             | Redis stream name.                                                                                                                 |
-| **`GroupName`**                    | **required**             | Consumer group name (auto-created at `0-0` if missing).                                                                            |
-| **`ConsumerName`**                | *auto-generated*         | Must be unique across consumers.                                                                                                    |
-| **`LockExpiryStr`**               | `"10s"`                  | Redsync lock expiration for message-level locks.                                                                                    |
-| **`LockExtendStr`**               | half of `LockExpiryStr`  | Interval to keep the lock alive via `ExtendContext`.                                                                                |
-| **`BlockDurationStr`**            | `"5s"`                   | How long `XREADGROUP` waits if no new messages arrive.                                                                             |
-| **`ReclaimStr`**                  | `"5s"`                   | Frequency of auto-reclaim if `EnableReclaim=true`.                                                                                 |
-| **`EnableReclaim`**               | `false`                  | Whether to run reclaim logic.                                                                                                       |
-| **`CleanOldReclaimDuration`**     | `"1h"`                   | Age threshold for removing stale reclaim records.                                                                                  |
-| **`MaxReclaimAttempts`**          | `3`                      | After exceeding this, messages are removed or go to DLQ.                                                                            |
-| **`ReclaimCount`**                | `10`                     | Number of messages to handle per `XAUTOCLAIM` pass.                                                                                 |
-| **`ReclaimMaxExponentialFactor`** | `3`                      | Max exponent for backoff. E.g. `factor = min(2^attempts, 8)`.                                                                       |
-| **`DLQHandler`**                  | `nil`                    | Optional function for messages beyond `MaxReclaimAttempts`.                                                                         |
-| **`IgnoreDLQHandlerErrors`**      | `false`                  | If **true**, remove message even if DLQ fails. Otherwise, keep it pending.                                                          |
-| **`DropConcurrentDuplicates`**    | `false`                  | If **true**, ephemeral lock on `Publish(...)` to skip near-simultaneous duplicates.                                                 |
-| **`MaxConcurrency`**              | `10`                     | If > 0, the library uses a channel-based limit for concurrency in `processMessage`.                                                 |
+| Field                             | Default                 | Description                                                                                                                                                      |
+|-----------------------------------|-------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| **`StreamName`**                  | **required**            | Redis stream name.                                                                                                                                               |
+| **`GroupName`**                   | **required**            | Consumer group name (auto-created at `0-0` if missing).                                                                                                          |
+| **`ConsumerName`**                | *auto-generated*        | Must be unique across consumers.                                                                                                                                 |
+| **`LockExpiryStr`**               | `"10s"`                 | Redsync lock expiration for message-level locks.                                                                                                                 |
+| **`LockExtendStr`**               | half of `LockExpiryStr` | Interval to keep the lock alive via `ExtendContext`.                                                                                                             |
+| **`BlockDurationStr`**            | `"5s"`                  | How long `XREADGROUP` waits if no new messages arrive.                                                                                                           |
+| **`ReclaimStr`**                  | `"5s"`                  | Frequency of auto-reclaim if `EnableReclaim=true`.                                                                                                               |
+| **`EnableReclaim`**               | `false`                 | Whether to run reclaim logic.                                                                                                                                    |
+| **`CleanOldReclaimDuration`**     | `"1h"`                  | Age threshold for removing stale reclaim records.                                                                                                                |
+| **`MaxReclaimAttempts`**          | `3`                     | After exceeding this, messages are removed or go to DLQ.                                                                                                         |
+| **`ReclaimCount`**                | `10`                    | Number of messages to handle per `XAUTOCLAIM` pass.                                                                                                              |
+| **`ReclaimMaxExponentialFactor`** | `3`                     | Max exponent for backoff. E.g. `factor = min(2^attempts, 8)`.                                                                                                    |
+| **`DLQHandler`**                  | `nil`                   | Optional function for messages beyond `MaxReclaimAttempts`.                                                                                                      |
+| **`IgnoreDLQHandlerErrors`**      | `false`                 | If **true**, remove message even if DLQ fails. Otherwise, keep it pending.                                                                                       |
+| **`DropConcurrentDuplicates`**    | `false`                 | If **true**, ephemeral lock on `Publish(...)` to skip near-simultaneous duplicates.                                                                              |
+| **`MaxConcurrency`**              | `10`                    | If > 0, the library uses a channel-based limit for concurrency in `processMessage`.                                                                              |
+| **`UseRedisIdAsUniqueID`**        | `false`                 | If **true**, - uses redis.XMessage -> ID as unique ID to not repeat processing of duplicates. <br/>Otherwise calculates full sha256 from entire message payload. |
 
 *(Your `*redis.UniversalOptions` can specify single node, cluster, or sentinel.)*
 

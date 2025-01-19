@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"github.com/redis/go-redis/v9"
 	"math/rand"
@@ -204,19 +205,35 @@ func processedSetKey(cfg Config) string {
 }
 
 // uniqueIDForMessage generates a unique identifier for a message within a specific consumer group and stream.
-// This identifier can be used for tracking or referencing messages across different contexts.
+// It either uses the Redis message ID or creates a hash based on the message content, depending on the configuration.
 //
 // Parameters:
-//   - cfg: A Config struct containing the configuration for the stream, including GroupName and StreamName.
-//   - msgID: A string representing the unique ID of the message within the Redis stream.
+//   - cfg: A Config struct containing the configuration for the stream, including GroupName, StreamName,
+//     and UseRedisIdAsUniqueID flag.
+//   - msg: A redis.XMessage struct representing the message from the Redis stream.
 //
 // Returns:
-//
-//	A string that combines the group name, stream name, and message ID in the format "group|stream|msgID".
-//	This ensures a globally unique identifier for the message across different consumer groups and streams.
-func uniqueIDForMessage(cfg Config, msgID string) string {
-	return fmt.Sprintf("%s|%s|%s",
+//   - string: A unique identifier for the message. If UseRedisIdAsUniqueID is true, it returns a string in the
+//     format "GroupName|StreamName|MessageID". Otherwise, it returns a hexadecimal string of a SHA256 hash
+//     generated from the group name, stream name, and message content.
+//   - error: An error if there's a problem marshaling the message fields to JSON, or nil if successful.
+func uniqueIDForMessage(cfg Config, msg redis.XMessage) (string, error) {
+	if cfg.UseRedisIdAsUniqueID {
+		return fmt.Sprintf("%s|%s|%s",
+			cfg.GroupName,
+			cfg.StreamName,
+			msg.ID), nil
+	}
+
+	// Build hash for message data
+	fields := convertFields(msg.Values)
+	fieldsJsonStr, err := json.Marshal(fields)
+	if err != nil {
+		return "", err
+	}
+	hash := sha256.Sum256([]byte(fmt.Sprintf("%s|%s|%s",
 		cfg.GroupName,
 		cfg.StreamName,
-		msgID)
+		fieldsJsonStr)))
+	return hex.EncodeToString(hash[:]), nil
 }
