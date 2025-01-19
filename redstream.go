@@ -43,11 +43,17 @@ type Config struct {
 
 	ProcessedIdsMaxAgeStr string `validate:"duration"`
 	UseRedisIdAsUniqueID  bool
+
+	StaleConsumerIdleThresholdStr string `validate:"duration"`
+	EnableStaleConsumerCleanup    bool
+
+	EnableAutoRejoinOnRemoved  bool
+	AutoRejoinCheckIntervalStr string `validate:"duration"`
 }
 
 // RedisStream is the main struct implementing IRedStream.
 type RedisStream struct {
-	Client redis.Cmdable
+	Client redis.UniversalClient
 	Rs     *redsync.Redsync
 	Cfg    Config
 
@@ -68,6 +74,9 @@ type RedisStream struct {
 	noProgressCount int // # times we saw zero reclaims in a row
 
 	luaScripts *lua.Scripts
+
+	staleIdleThreshold time.Duration
+	autoRejoinInterval time.Duration
 }
 
 // New creates and initializes a new IRedStream instance.
@@ -97,6 +106,8 @@ func New(redisOptions *redis.UniversalOptions, cfg Config) IRedStream {
 	reclaimInterval := ParseDurationOrDefault(&cfg.ReclaimStr, 5*time.Second)
 	cleanOldReclaimDuration := ParseDurationOrDefault(&cfg.CleanOldReclaimDuration, 1*time.Hour)
 	processedIdsMaxAge := ParseDurationOrDefault(&cfg.ProcessedIdsMaxAgeStr, 24*time.Hour)
+	staleIdle := ParseDurationOrDefault(&cfg.StaleConsumerIdleThresholdStr, 2*time.Minute)
+	autoRejoinInterval := ParseDurationOrDefault(&cfg.AutoRejoinCheckIntervalStr, 30*time.Second)
 
 	// validate or fix defaults
 	if cfg.MaxReclaimAttempts <= 0 {
@@ -152,6 +163,8 @@ func New(redisOptions *redis.UniversalOptions, cfg Config) IRedStream {
 		ReclaimInterval:         reclaimInterval,
 		CleanOldReclaimDuration: cleanOldReclaimDuration,
 		ProcessedIdsMaxAge:      processedIdsMaxAge,
+		staleIdleThreshold:      staleIdle,
+		autoRejoinInterval:      autoRejoinInterval,
 	}
 }
 
@@ -283,7 +296,214 @@ func (r *RedisStream) StartConsumer(ctx context.Context) error {
 		}
 	}()
 
+	if r.Cfg.EnableStaleConsumerCleanup {
+		go r.autoRemoveStaleConsumers(ctx)
+	}
+
+	if r.Cfg.EnableAutoRejoinOnRemoved {
+		go r.autoCheckRejoin(ctx)
+	}
+
 	return nil
+}
+
+// autoCheckRejoin periodically checks if the current consumer is still part of the consumer group
+// and attempts to rejoin if it has been removed. This function runs in a loop until the context
+// is canceled, checking at intervals specified by r.autoRejoinInterval.
+//
+// Parameters:
+//   - ctx: A context.Context for handling cancellation and timeouts.
+//
+// The function does not return any value. It continues to run until the context is canceled,
+// logging errors if they occur during the check or rejoin process.
+func (r *RedisStream) autoCheckRejoin(ctx context.Context) {
+	ticker := time.NewTicker(r.autoRejoinInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			inList, err := r.isInConsumerList(ctx)
+			if err != nil {
+				r.err(ctx, "autoCheckRejoin: isInConsumerList error:", err)
+				continue
+			}
+			if !inList {
+				r.info(ctx, "Detected that we were removed. Will rejoin the group now.")
+				r.rejoinConsumerGroup(ctx)
+			}
+		}
+	}
+}
+
+// isInConsumerList checks if the current consumer is present in the consumer list of the Redis stream group.
+//
+// This function executes an XINFO CONSUMERS command on the Redis server to retrieve information about
+// all consumers in the specified stream group. It then parses the result to check if the current
+// consumer (identified by r.Cfg.ConsumerName) is present in the list.
+//
+// Parameters:
+//   - ctx: A context.Context for handling cancellation and timeouts.
+//
+// Returns:
+//   - bool: true if the current consumer is found in the list, false otherwise.
+//   - error: An error if the Redis command fails or if the result is in an unexpected format.
+//     Returns nil if the operation is successful, even if the consumer is not found.
+func (r *RedisStream) isInConsumerList(ctx context.Context) (bool, error) {
+	res, err := r.Client.Do(ctx, "XINFO", "CONSUMERS", r.Cfg.StreamName, r.Cfg.GroupName).Result()
+	if err != nil {
+		return false, err
+	}
+	list, ok := res.([]interface{})
+	if !ok {
+		return false, fmt.Errorf("unexpected XINFO CONSUMERS result type: %T", res)
+	}
+	for _, c := range list {
+		items, ok := c.([]interface{})
+		if !ok {
+			continue
+		}
+		var name string
+		for i := 0; i < len(items)-1; i += 2 {
+			field, _ := items[i].(string)
+			val := items[i+1]
+			if field == "name" {
+				name, _ = val.(string)
+			}
+		}
+		if name == r.Cfg.ConsumerName {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// rejoinConsumerGroup attempts to rejoin the consumer group by performing a dummy read operation.
+// This function is used to re-create the consumer record in Redis when it has been removed or lost.
+//
+// It performs an XREADGROUP operation with COUNT=0, which doesn't actually read any messages
+// but causes Redis to recognize the consumer as part of the group again.
+//
+// Parameters:
+//   - ctx: A context.Context for handling cancellation and timeouts.
+//
+// The function doesn't return any value, but it logs errors if the rejoin attempt fails
+// and logs an info message if the consumer is successfully re-created in the group.
+func (r *RedisStream) rejoinConsumerGroup(ctx context.Context) {
+	// Just do a dummy read with COUNT=0 so Redis re-creates our consumer record
+	args := &redis.XReadGroupArgs{
+		Group:    r.Cfg.GroupName,
+		Consumer: r.Cfg.ConsumerName,
+		Streams:  []string{r.Cfg.StreamName, ">"},
+		Count:    0,
+		Block:    10 * time.Millisecond,
+	}
+	_, err := r.Client.XReadGroup(ctx, args).Result()
+	if err != nil && !errors.Is(err, redis.Nil) {
+		r.err(ctx, "rejoinConsumerGroup XReadGroup error:", err)
+	} else {
+		r.info(ctx, "rejoinConsumerGroup: consumer is now re-created in group:", r.Cfg.ConsumerName)
+	}
+}
+
+// autoRemoveStaleConsumers periodically checks for and removes stale consumers from the Redis stream group.
+// It runs in a loop, calling removeStaleConsumers every 30 seconds until the context is canceled.
+//
+// Parameters:
+//   - ctx: A context.Context for handling cancellation and timeouts.
+//
+// This function does not return any value. It continues to run until the context is canceled.
+func (r *RedisStream) autoRemoveStaleConsumers(ctx context.Context) {
+	// run every 30 seconds, tune as desired
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			r.removeStaleConsumers(ctx)
+		}
+	}
+}
+
+// removeStaleConsumers identifies and removes inactive consumers from the Redis stream group.
+// It queries the Redis server for consumer information, checks each consumer's idle time,
+// and removes those that have been inactive for longer than the configured threshold.
+//
+// The function uses the XINFO CONSUMERS command to get information about consumers,
+// including their names and idle times. It then processes this information to identify
+// stale consumers and removes them using the XGROUP DELCONSUMER command.
+//
+// Parameters:
+//   - ctx: A context.Context for handling cancellation and timeouts.
+//
+// The function doesn't return any value but performs the following actions:
+// - Logs errors if there are issues querying consumer information or removing consumers.
+// - Removes consumers that have been idle for longer than r.staleIdleThreshold.
+// - Skips removal of the current consumer (r.Cfg.ConsumerName).
+func (r *RedisStream) removeStaleConsumers(ctx context.Context) {
+	// We call XINFO CONSUMERS <stream> <group>
+	// It returns an array of consumer info arrays, each like:
+	//   1) "name"
+	//   2) "consumerName"
+	//   3) "pending"
+	//   4) (integer) <numPending>
+	//   5) "idle"
+	//   6) (integer) <idleMillis>
+	//   ...
+	//
+	// We'll parse them, check any idle > r.staleIdleThreshold, and if so, call XGROUP DELCONSUMER
+
+	res, err := r.Client.Do(ctx, "XINFO", "CONSUMERS", r.Cfg.StreamName, r.Cfg.GroupName).Result()
+	if err != nil {
+		r.err(ctx, "XINFO CONSUMERS error:", err)
+		return
+	}
+
+	consumers, ok := res.([]interface{})
+	if !ok {
+		r.err(ctx, "XINFO CONSUMERS returned unexpected type:", res)
+		return
+	}
+
+	for _, c := range consumers {
+		items, ok := c.([]interface{})
+		if !ok {
+			continue
+		}
+
+		var name string
+		var idleMS int64
+
+		for i := 0; i < len(items)-1; i += 2 {
+			field, _ := items[i].(string)
+			val := items[i+1]
+
+			switch field {
+			case "name":
+				name, _ = val.(string)
+			case "idle":
+				idleMS, _ = val.(int64)
+			}
+		}
+
+		// Skip our own consumer
+		if name == r.Cfg.ConsumerName {
+			continue
+		}
+
+		// If idle time > threshold, remove
+		if time.Duration(idleMS)*time.Millisecond > r.staleIdleThreshold {
+			r.info(ctx, "Removing stale consumer:", name, "idle =", idleMS, "ms")
+			if delErr := r.Client.XGroupDelConsumer(ctx, r.Cfg.StreamName, r.Cfg.GroupName, name).Err(); delErr != nil {
+				r.err(ctx, "XGROUP DELCONSUMER failed:", delErr)
+			}
+		}
+	}
 }
 
 // readPendingMessagesOnce reads and processes pending messages for the current consumer
