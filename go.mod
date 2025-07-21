@@ -1,6 +1,8 @@
 module github.com/smarter-day/redstream
 
-go 1.22
+go 1.22.0
+
+toolchain go1.24.4
 
 require (
 	github.com/go-playground/validator/v10 v10.23.0
